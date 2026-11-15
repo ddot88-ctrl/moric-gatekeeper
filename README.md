@@ -61,6 +61,54 @@ npm test               # local end-to-end harness (31 checks, no keys needed)
 npm run proof-test     # circuit-only proof test (6 cases)
 ```
 
+## Deploy on Vercel (free hobby tier)
+
+The agent is a plain Node.js serverless function — no framework, no always-on
+server. Deploy it from the GitHub repo:
+
+1. **Vercel account** — sign up at https://vercel.com (free hobby tier).
+2. **Import the repo** — Add New → Project → Import Git Repository →
+   `ddot88-ctrl/moric-gatekeeper`. Framework Preset: **Other**.
+3. **Build command** — Vercel runs the `vercel-build` script from
+   `package.json` automatically: it downloads the tournament circuit files
+   (`gatekeeper.wasm` + `gatekeeper_final.zkey`, binary, not in the repo)
+   into `./circuits/` at build time. If the dashboard shows an empty build
+   command, set it explicitly to `npm run vercel-build`.
+4. **Environment variables** (Settings → Environment Variables):
+   - `AGENT_GAMES_HMAC_SECRET` — **required**, from the Agent Games
+     dashboard "Rotate Secret" (shown once at registration).
+   - `KURIER_API_KEY` — optional; accepted but NOT used in-request on
+     serverless (see below).
+   - `REGISTERED_VK_HASH` — optional, informational.
+5. **Deploy.** Your endpoint is `https://<project>.vercel.app/agent`
+   (rewritten from `/agent` to the function by `vercel.json`); liveness at
+   `https://<project>.vercel.app/health`.
+6. **Register it** on the dashboard with that endpoint URL (see "Register it"
+   below), then pass the signed **preflight** and run **practice tasks**.
+
+**Hobby-tier limits, honestly stated:**
+- **10s execution limit** (`maxDuration: 10` in `vercel.json`). The hot
+  path — HMAC + decide + local Groth16 proof — measures ~1–2s, so it fits
+  with margin. If proof generation ever starts with <3s of budget left, the
+  handler answers the decision without a proof rather than being killed
+  mid-flight.
+- **Kurier is skipped in-request** (`kurier_status: SKIPPED_SERVERLESS`).
+  A serverless function freezes after the response, so polling Kurier to
+  `Finalized` cannot reliably happen inside the request. The local proof is
+  always returned and the platform re-verifies it against its own key — that
+  is what the scoring uses. On-chain `Finalized` confirmations would need a
+  separate cron/queue, not this handler.
+- **Replay cache is per-instance memory.** A retried task hitting a different
+  warm instance is re-decided (deterministic, same answer), but the
+  `PROOF_REUSED` check may miss across instances. Upgrade path: a shared
+  store (Vercel KV / Upstash Redis) for the seen proof refs.
+- **Cold starts.** The first request after idle takes ~1–2s extra (module
+  load + snarkjs init). Vercel hobby instances sleep after inactivity, so
+  the very first task of a round may be slow — keep the function warm with
+  a periodic ping to `/health` if the round timing is tight. (The platform
+  forfeits a task if the agent is offline when it arrives; a sleeping
+  serverless function still answers, just slower on the first call.)
+
 ## Register it
 
 1. Deploy this service at a **public HTTPS URL** (see Deployment below).
@@ -82,17 +130,19 @@ npm run proof-test     # circuit-only proof test (6 cases)
 
 **The endpoint must be a public HTTPS URL on the standard port, and it must
 stay up.** The platform's policy is explicit: if your agent is offline when a
-task arrives, you forfeit that task. Free-tier hosting that sleeps after
-inactivity will cost you tasks. Rounds run 16:00–02:00 IST (17:30–03:30 WIB).
+task arrives, you forfeit that task. Rounds run 16:00–02:00 IST (17:30–03:30 WIB).
 
-This code was built and tested on a VM with **no public IP** — its egress
-proxy blocks the free no-account tunnels (trycloudflare returns HTTP 403,
-localtunnel and bore.pub are unreachable, ngrok needs an account). So the
-deployment target is still **TBD**. Working routes that need an account:
+**Vercel (see "Deploy on Vercel" above) is the concrete route for this repo:**
+the code is already adapted as serverless functions (`api/agent.js`), the
+circuit files download at build time, and the hobby tier is free. Its limits
+(10s execution, per-instance memory, cold starts) are documented in that
+section — none of them breaks the hot path, but all of them are real.
 
-- **Tailscale Funnel** — expose the local server on a public `*.ts.net` URL.
-- **Serverless / PaaS** — Vercel, Fly.io, Render, Railway (needs an account
-  and a deploy; the service is a plain Node.js HTTP server, no framework).
+The fallback routes that need an account:
+
+- **Tailscale Funnel** — expose the local `server.js` on a public `*.ts.net` URL.
+- **Other PaaS** — Fly.io, Render, Railway (the service is a plain Node.js
+  HTTP server, no framework).
 - Any VPS with a public IP + a reverse proxy with TLS.
 
 Do not register a `localhost` or private-IP endpoint — the platform rejects it.
@@ -102,15 +152,19 @@ Do not register a `localhost` or private-IP endpoint — the platform rejects it
 | File | What it is |
 |---|---|
 | `server.js` | HTTP server: HMAC, preflight, decision, proof, Kurier, signed responses |
+| `api/agent.js` | Vercel serverless handler: same flow as `server.js`, 10s budget, Kurier skipped in-request, per-instance memory only |
+| `api/health.js` | Vercel liveness check: GET /health |
+| `vercel.json` | Vercel config: `/agent` + `/health` rewrites, `maxDuration: 10`, `includeFiles: circuits/**` |
 | `decide.js` | Deterministic decision checklist (pure function, no I/O) |
 | `circuit-input.js` | Task envelope → 13 circuit inputs (encoding + TODOs, see below) |
-| `kurier.js` | Kurier REST client: register-vk, submit-proof, poll job-status |
+| `kurier.js` | Kurier REST client: register-vk, submit-proof, poll job-status (used by `server.js` only) |
 | `circuits/` | Tournament artifacts: `gatekeeper.wasm`, `gatekeeper_final.zkey`, `verification_key.json` (exported from the zkey) |
 | `test-local.js` | End-to-end harness: spawns the server, replays preflight / valid / 5 traps / reuse / replay / bad HMAC / malformed JSON |
+| `test-vercel.mjs` | Same envelope cases against the Vercel handler directly (mock req/res, no server, no deploy) |
 | `proof-test.mjs` | Circuit-only test: 6 proof cases against the real circuit |
-| `scripts/` | One-off probes used to recover the 13 circuit input signal names |
+| `scripts/` | One-off probes used to recover the 13 circuit input signal names + `download-circuits.mjs` (build-time circuit fetch) |
 | `.env.example` | Env template (no secrets) |
-| `seen.json` | Runtime state (used proof refs + cached responses) — gitignored |
+| `seen.json` | Runtime state (used proof refs + cached responses) — gitignored, `server.js` only |
 | `kurier-vk.json` | Cached Kurier vkHash — gitignored |
 
 ## Circuit details (verified locally, 2026-11-15)
@@ -187,3 +241,10 @@ valid APPROVE generates + verifies; a wrong APPROVE and a wrong REJECT both
 fail witness generation (`Assert Failed` in `GatekeeperEvaluation`); correct
 REJECTs for recipient mismatch, VK substitution, and threshold mismatch
 generate + verify.
+
+`node test-vercel.mjs` — the same envelope cases as `npm test`, run against
+the Vercel handler (`api/agent.js`) directly with mock req/res (no server, no
+deploy): preflight, valid APPROVE with a verifying proof, replay, all 5 trap
+REJECTs with verifying proofs, PROOF_REUSED, bad HMAC → 401, malformed JSON →
+signed REJECT, missing HMAC secret → 500. Also checks the handler answers
+well inside the 10s hobby budget.
